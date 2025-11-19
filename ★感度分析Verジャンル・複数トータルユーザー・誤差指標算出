@@ -1,0 +1,377 @@
+# ==============================================================================
+# Step 0: 必要なライブラリのインストールと認証
+# ==============================================================================
+!pip install --upgrade google-api-python-client google-auth-httplib2 google-auth-oauthlib gspread gspread-dataframe japanize-matplotlib scikit-learn
+
+import pandas as pd
+import numpy as np
+from scipy.optimize import minimize
+from scipy.special import gammaln
+import matplotlib.pyplot as plt
+import japanize_matplotlib
+import gspread
+from google.colab import auth
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+from google.auth import default
+from datetime import datetime
+import pytz
+from gspread_dataframe import set_with_dataframe
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+import os
+
+# Google Colabでの認証
+auth.authenticate_user()
+creds, _ = default()
+gc = gspread.authorize(creds)
+drive_service = build('drive', 'v3', credentials=creds)
+
+print("✅ 認証とライブラリの準備が完了しました。")
+print("-" * 50)
+
+
+# ==============================================================================
+# ▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼ 設定ブロック（修正版） ▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼
+# ==============================================================================
+TARGET_FOLDER_NAME = '20251019_VODデータ分析'
+WORKSHEET_NAME_TO_READ = '集計スポーツ'
+
+# 【修正】感度分析のシナリオを自動生成（例：10万〜30万まで、1万刻みで検証）
+# 範囲や刻み幅を変更したい場合はここを数値を変えてください
+START_USERS = 100000  # 最小母数
+END_USERS   = 300000  # 最大母数
+STEP_USERS  = 10000   # 刻み幅
+TOTAL_VOD_USERS_LIST = list(range(START_USERS, END_USERS + 1, STEP_USERS))
+
+IMAGE_OUTPUT_FOLDER_NAME = 'NBD分析グラフ出力'
+
+jst = pytz.timezone('Asia/Tokyo')
+current_time_str = datetime.now(jst).strftime('%Y%m%d_%H%M%S')
+OUTPUT_SPREADSHEET_NAME = f'NBDモデル感度分析_{current_time_str}'
+# ==============================================================================
+# ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲ 設定はここまで ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
+# ==============================================================================
+
+
+# ==============================================================================
+# Step 1 & 2: Google Driveからデータを取得し、結合する
+# ==============================================================================
+print(f"\nStep 1 & 2: Google Drive '{TARGET_FOLDER_NAME}' からデータを読み込み、結合します...")
+all_dataframes = []
+spreadsheet_files = []
+try:
+    folder_response = drive_service.files().list(
+        q=f"name='{TARGET_FOLDER_NAME}' and mimeType='application/vnd.google-apps.folder' and trashed=false",
+        spaces='drive', fields='files(id, name)').execute()
+    folders = folder_response.get('files', [])
+    if not folders:
+        print(f"-> ❌【エラー！】フォルダ '{TARGET_FOLDER_NAME}' が見つかりません。")
+    else:
+        folder_id = folders[0].get('id')
+        page_token = None
+        sheets_in_folder = []
+        while True:
+            sheet_response = drive_service.files().list(
+                q=f"'{folder_id}' in parents and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false",
+                spaces='drive', fields='nextPageToken, files(id, name)', pageToken=page_token).execute()
+            sheets_in_folder.extend(sheet_response.get('files', []))
+            page_token = sheet_response.get('nextPageToken', None)
+            if page_token is None: break
+        if sheets_in_folder:
+            spreadsheet_files = sheets_in_folder
+except Exception as e:
+    print(f"-> ❌【エラー！】フォルダ検索中にエラーが発生しました: {e}")
+
+if spreadsheet_files:
+    print(f"-> ✅ {len(spreadsheet_files)}個のスプレッドシートが見つかりました。")
+    for sheet_file in spreadsheet_files:
+        file_name = sheet_file.get('name')
+        print(f"📄 '{file_name}' の '{WORKSHEET_NAME_TO_READ}' シートを読み込んでいます..." )
+        try:
+            spreadsheet = gc.open(file_name)
+            worksheet = spreadsheet.worksheet(WORKSHEET_NAME_TO_READ)
+            data = worksheet.get_all_records()
+            df = pd.DataFrame.from_records(data)
+            df = df.loc[:, ~df.columns.str.contains('^Unnamed')]
+            all_dataframes.append(df)
+            print(f"-> ✅ 読み込み成功！ {len(df)} 件のデータを取得しました。")
+        except gspread.exceptions.WorksheetNotFound:
+            print(f"-> ❌【エラー！】シート '{WORKSHEET_NAME_TO_READ}' が '{file_name}' に見つかりません。")
+        except Exception as e:
+            print(f"-> ❌【エラー！】: {e}")
+else:
+    print(f"-> ❌【エラー！】フォルダ内にスプレッドシートが見つかりません。")
+
+if all_dataframes:
+    df_main = pd.concat(all_dataframes, ignore_index=True)
+    print(f"✅ 全データの結合が完了しました。合計 {len(df_main)} 件のデータ。")
+else:
+    df_main = pd.DataFrame()
+    print("⚠️ 読み込めるデータがなかったため、分析は実行されません。")
+print("-" * 50)
+
+
+# ==============================================================================
+# Step 3: 分析と可視化を行う関数を定義
+# ==============================================================================
+def analyze_nbd_fit(data_df, title, total_users):
+    print(f"--- 分析開始: {title} (総ユーザー数: {total_users}) ---")
+    if data_df.empty or data_df['頻度ごとのユニークユーザー'].sum() == 0:
+        return None, None, None, None
+    
+    data_df['視聴頻度_数値'] = pd.to_numeric(data_df['視聴頻度'].astype(str).str.replace('+', ''), errors='coerce')
+    
+    program_unique_users = data_df['番組のユニークユーザー'].iloc[0]
+    program_total_views = data_df['番組の総視聴回数'].iloc[0]
+    
+    if total_users == 0 or program_unique_users == 0: return None, None, None, None
+    
+    b = program_unique_users / total_users
+    w = program_total_views / program_unique_users
+    M = w * b
+    
+    def nbd_probability(r, K, M):
+        with np.errstate(divide='ignore', invalid='ignore'):
+            log_p = gammaln(K + r) - gammaln(K) - gammaln(r + 1) + r * np.log(M / (M + K)) + K * np.log(K / (K + M))
+        return np.exp(log_p)
+    
+    def objective_function(K, data, M):
+        K = K[0]
+        if K <= 0: return np.inf
+        
+        max_freq = int(data['視聴頻度_数値'].max())
+        has_plus_category = '+' in str(data['視聴頻度'].iloc[-1])
+        
+        if has_plus_category:
+            r_values_prob = np.arange(0, max_freq)
+            probabilities = nbd_probability(r_values_prob, K, M)
+            prob_plus = 1 - probabilities.sum()
+            full_probabilities = np.append(probabilities, prob_plus)
+            
+            actuals_freq = pd.Series(data['頻度ごとのユニークユーザー'].values, index=data['視聴頻度_数値'].values)
+            r_values_actual = np.arange(1, max_freq + 1)
+            actuals_reindexed = actuals_freq.reindex(r_values_actual, fill_value=0).values
+            actuals = np.concatenate(([total_users - program_unique_users], actuals_reindexed))
+        else:
+            r_values = np.arange(0, max_freq + 1)
+            full_probabilities = nbd_probability(r_values, K, M)
+            
+            actuals_freq = pd.Series(data['頻度ごとのユニークユーザー'].values, index=data['視聴頻度_数値'].values)
+            actuals = actuals_freq.reindex(r_values, fill_value=0).values
+            actuals[0] = total_users - program_unique_users
+            
+        full_probabilities[full_probabilities <= 0] = 1e-10
+        
+        if len(actuals) != len(full_probabilities): return np.inf
+        
+        log_likelihood = np.sum(actuals * np.log(full_probabilities))
+        return -log_likelihood
+
+    # 最適化実行
+    result = minimize(objective_function, [1.0], args=(data_df, M), bounds=[(1e-6, None)])
+    optimal_K = result.x[0]
+    
+    if optimal_K > 1e5 or not result.success: return None, None, None, None
+    
+    print(f"-> 推定された最適なKパラメータ: {optimal_K:.4f}")
+    
+    # グラフ描画用データ作成
+    prob_0 = nbd_probability(0, optimal_K, M)
+    r_plot = data_df['視聴頻度_数値']
+    theoretical_probs = nbd_probability(r_plot, optimal_K, M)
+    
+    if '+' in str(data_df['視聴頻度'].iloc[-1]):
+      prob_sum_until_9 = nbd_probability(np.arange(0, 10), optimal_K, M).sum()
+      theoretical_probs.iloc[-1] = (1 - prob_sum_until_9)
+      
+    theoretical_users = (theoretical_probs / (1 - prob_0)) * program_unique_users
+    
+    result_df = pd.DataFrame({
+        '視聴頻度': data_df['視聴頻度'].astype(str), 
+        '実績ユーザー数': data_df['頻度ごとのユニークユーザー'], 
+        '理論ユーザー数（NBDモデル）': theoretical_users.round(2)
+    })
+    
+    actual = result_df['実績ユーザー数']
+    predicted = result_df['理論ユーザー数（NBDモデル）']
+    mae = mean_absolute_error(actual, predicted)
+    rmse = np.sqrt(mean_squared_error(actual, predicted))
+    error_metrics = {'MAE': mae, 'RMSE': rmse}
+    
+    print(f"-> MAE: {mae:.2f}, RMSE: {rmse:.2f}")
+    
+    # グラフ描画
+    fig = plt.figure(figsize=(12, 7))
+    plt.bar(result_df['視聴頻度'], result_df['実績ユーザー数'], label='実績ユーザー数', color='skyblue', zorder=2)
+    plt.plot(result_df['視聴頻度'], result_df['理論ユーザー数（NBDモデル）'], 'o-', label='NBDモデルによる理論値', color='tomato', markersize=8, zorder=3)
+    
+    plt.xlabel('視聴回数 (r)', fontsize=14)
+    plt.ylabel('ユニークユーザー数', fontsize=14)
+    plt.title(f'【{title}】\nNBDモデル適合度分析 (総ユーザー数={total_users}, 推定K={optimal_K:.4f})', fontsize=16)
+    plt.legend(fontsize=12)
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    
+    image_filename = f"chart_{title.replace(':', '').replace('/', '').replace(' ', '_')}_U{total_users}.png"
+    plt.savefig(image_filename)
+    plt.show()
+    plt.close(fig)
+    print("-" * 50)
+    
+    return result_df, optimal_K, error_metrics, image_filename
+
+
+# ==============================================================================
+# Step 4: 複数シナリオで分析を実行 ＆ 結果をスプレッドシートに出力
+# ==============================================================================
+if not df_main.empty:
+    print("\n\nStep 4: 全シナリオで分析を実行し、スプレッドシートに出力します...")
+    output_spreadsheet = None
+    image_folder_id = None
+    
+    # 画像保存フォルダの準備
+    try:
+        folder_response = drive_service.files().list(
+            q=f"name='{IMAGE_OUTPUT_FOLDER_NAME}' and mimeType='application/vnd.google-apps.folder' and trashed=false", 
+            spaces='drive', fields='files(id)').execute()
+        folders = folder_response.get('files', [])
+        if folders:
+            image_folder_id = folders[0]['id']
+            print(f"✅ グラフ保存用フォルダ '{IMAGE_OUTPUT_FOLDER_NAME}' が見つかりました。")
+        else:
+            folder_metadata = {'name': IMAGE_OUTPUT_FOLDER_NAME, 'mimeType': 'application/vnd.google-apps.folder'}
+            folder = drive_service.files().create(body=folder_metadata, fields='id').execute()
+            image_folder_id = folder.get('id')
+            print(f"✅ グラフ保存用フォルダ '{IMAGE_OUTPUT_FOLDER_NAME}' を新規作成しました。")
+    except Exception as e: print(f"-> ❌【エラー！】グラフ保存用フォルダの準備中にエラーが発生しました: {e}")
+
+    # 出力用スプレッドシートの準備
+    try:
+        output_spreadsheet = gc.create(OUTPUT_SPREADSHEET_NAME)
+        summary_sheet = output_spreadsheet.sheet1
+        summary_sheet.update_title('サマリー')
+        print(f"✅ 結果出力用のスプレッドシート '{OUTPUT_SPREADSHEET_NAME}' を作成しました。")
+    except Exception as e: print(f"-> ❌【エラー！】スプレッドシートの作成に失敗しました: {e}")
+
+    summary_data = []
+
+    if output_spreadsheet and image_folder_id:
+        genre_groups = df_main.groupby('genre')
+        
+        # ジャンルごとにループ
+        for genre_name, df_genre in genre_groups:
+            try:
+                # シート名は31文字以内の制限があるため調整
+                sheet_title = str(genre_name)[:30]
+                worksheet = output_spreadsheet.add_worksheet(title=sheet_title, rows=1000, cols=30)
+                current_row = 1
+            except Exception as e: 
+                print(f"-> ❌【エラー！】シート '{genre_name}' の作成に失敗しました: {e}")
+                continue
+
+            # シナリオ（総ユーザー数）ごとにループ
+            for total_users_scenario in TOTAL_VOD_USERS_LIST:
+                df_genre_agg = df_genre.groupby('視聴頻度')['頻度ごとのユニークユーザー'].sum().reset_index()
+                genre_unique_users = df_genre.groupby('program_title')['番組のユニークユーザー'].first().sum()
+                genre_total_views = df_genre.groupby('program_title')['番組の総視聴回数'].first().sum()
+                
+                df_genre_agg['番組のユニークユーザー'] = genre_unique_users
+                df_genre_agg['番組の総視聴回数'] = genre_total_views
+                
+                df_genre_agg['sort_key'] = pd.to_numeric(df_genre_agg['視聴頻度'].astype(str).str.replace('+', ''), errors='coerce')
+                df_genre_agg = df_genre_agg.sort_values('sort_key').drop('sort_key', axis=1)
+
+                result_df, optimal_K, error_metrics, image_filename = analyze_nbd_fit(df_genre_agg, f"ジャンル: {genre_name}", total_users_scenario)
+
+                if result_df is not None:
+                    summary_data.append({
+                        'ジャンル': genre_name, 
+                        '総ユーザー数シナリオ': total_users_scenario, 
+                        '推定されたKパラメータ': optimal_K, 
+                        'MAE': error_metrics['MAE'], 
+                        'RMSE': error_metrics['RMSE']
+                    })
+                    
+                    header_df = pd.DataFrame({
+                        '項目': [f'総ユーザー数シナリオ', '推定されたKパラメータ', 'MAE (平均絶対誤差)', 'RMSE (二乗平均平方根誤差)'], 
+                        '値': [f'{total_users_scenario}', f'{optimal_K:.4f}', f"{error_metrics['MAE']:.2f}", f"{error_metrics['RMSE']:.2f}"]
+                    })
+                    set_with_dataframe(worksheet, header_df, row=current_row, col=1, include_index=False)
+                    set_with_dataframe(worksheet, result_df, row=current_row, col=3) # D列から表を書き込み
+    
+                    try:
+                        file_metadata = {'name': image_filename, 'parents': [image_folder_id]}
+                        media = MediaFileUpload(image_filename, mimetype='image/png')
+                        image_file = drive_service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+                        image_id = image_file.get('id')
+                        drive_service.permissions().create(fileId=image_id, body={'type': 'anyone', 'role': 'reader'}).execute()
+                        image_url = f'https://drive.google.com/uc?id={image_id}'
+                        
+                        worksheet.update_acell(f'J{current_row}', f'=IMAGE("{image_url}")') # J列に画像を挿入
+                        print(f"-> ✅ グラフ画像をシートの J{current_row} に挿入しました。")
+                        os.remove(image_filename)
+                    except Exception as e: print(f"-> ❌【エラー！】グラフ画像の埋め込み中にエラーが発生しました: {e}")
+                    
+                    current_row += len(result_df) + 3
+            
+            print(f"-> ✅ ジャンル '{genre_name}' の全シナリオ結果をシートに書き込みました。")
+
+        # 全ジャンル処理終了後、サマリー作成
+        if summary_data:
+            try:
+                summary_df_all = pd.DataFrame(summary_data)
+                summary_pivot = pd.pivot_table(
+                    summary_df_all, 
+                    index='ジャンル', 
+                    columns='総ユーザー数シナリオ', 
+                    values=['推定されたKパラメータ', 'MAE', 'RMSE']
+                )
+                
+                # Kパラメータの小さい順（熱狂度が高い順）に並べ替え（最小シナリオ基準）
+                summary_pivot = summary_pivot.sort_values(by=('推定されたKパラメータ', TOTAL_VOD_USERS_LIST[0]))
+                
+                set_with_dataframe(summary_sheet, summary_pivot.reset_index())
+                print("\n-> ✅ 全シナリオのKパラメータと誤差指標を比較した「サマリー」シートを更新しました。")
+
+                # ==============================================================================
+                # 【追加】感度分析：ランク安定性の検証（論文のディフェンス用）
+                # ==============================================================================
+                print("\n🔍 感度分析：母数設定による「Kの順位変動」をチェックします...")
+                
+                # ピボットテーブルから「Kパラメータ」の部分だけを抽出
+                k_pivot = summary_pivot['推定されたKパラメータ']
+                
+                # 最小母数シナリオと最大母数シナリオの列名を取得
+                min_scenario = TOTAL_VOD_USERS_LIST[0]
+                max_scenario = TOTAL_VOD_USERS_LIST[-1]
+                
+                # 順位（ランク）に変換
+                rank_min = k_pivot[min_scenario].rank()
+                rank_max = k_pivot[max_scenario].rank()
+                
+                # スピアマンの順位相関係数を算出（1.0に近いほど、順位が完全に入れ替わっていない＝頑健）
+                rank_corr = rank_min.corr(rank_max, method='spearman')
+                
+                print(f"📊 最小シナリオ({min_scenario})と最大シナリオ({max_scenario})の順位相関係数: {rank_corr:.4f}")
+                
+                if rank_corr > 0.9:
+                    print("✅ 判定: 非常に高い順位安定性があります。母数の設定値を変えても「どのジャンルが熱狂的か」の結論はほぼ変わりません。")
+                    defense_comment = "【ロバスト性あり】母数設定による順位変動は軽微"
+                else:
+                    print("⚠️ 判定: 順位の入れ替わりが発生しています。母数設定により結論が変わる可能性があります。")
+                    defense_comment = "【注意】母数設定により順位が変動"
+
+                # 検証結果をシートに追記
+                defense_df = pd.DataFrame({
+                    '検証項目': ['順位安定性(スピアマン相関)', '最小シナリオ', '最大シナリオ', '判定コメント'],
+                    '値': [f'{rank_corr:.4f}', min_scenario, max_scenario, defense_comment]
+                })
+                
+                # サマリーシートの右側（例：Q列あたり）に検証結果を出力
+                set_with_dataframe(summary_sheet, defense_df, row=1, col=17) # Q列
+                print("✅ 感度分析の検証結果をサマリーシートに追記しました。")
+
+            except Exception as e: print(f"-> ❌【エラー！】サマリーシートの作成中にエラーが発生しました: {e}")
+
+        print("\n\n🎉 全ての処理が完了しました！ 🎉")
+        print(f"分析結果は以下のスプレッドシートに出力されています:")
+        print(f"🔗 {output_spreadsheet.url}")
